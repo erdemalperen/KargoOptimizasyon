@@ -13,3 +13,10 @@ Thumbs.db
 
 # Claude
 .claude/
+
+# Python env/cache
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+cache/
