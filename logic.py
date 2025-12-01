@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -19,7 +20,8 @@ CKAN_BASE_URL = "https://data.ibb.gov.tr/api/3/action"
 
 
 def _slugify(text: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", text.strip().lower())
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "_", ascii_text.strip().lower())
     slug = slug.strip("_")
     return slug or "graph"
 
@@ -35,41 +37,68 @@ def _ensure_travel_attributes(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
     return graph
 
 
-def get_graph(place_name: str = "Kadıköy, Istanbul, Turkey", *, use_cache: bool = True) -> Optional[nx.MultiDiGraph]:
+def get_graph(place_name: str = "Kadikoy, Istanbul, Turkey", *, use_cache: bool = True) -> Optional[nx.MultiDiGraph]:
     """
-    Gerçek trafik ağını (OSM sürüş ağı) indirir veya önbellekten yükler.
+    Gercek trafik agini (OSM surucu agi) indirir veya onbellekten yukler.
+    Unicode iceren sorgular nadiren 0 sonuc dondurebildiginden ASCII'ye
+    sadelestirilmis bir yedek sorgu da denenir.
     """
-    slug = _slugify(place_name)
-    cache_path = CACHE_DIR / f"{slug}.graphml"
+    last_error: Optional[Exception] = None
+    place_candidates = [place_name]
+    ascii_place = _strip_accents(place_name)
+    if ascii_place != place_name:
+        place_candidates.append(ascii_place)
 
-    try:
-        graph: Optional[nx.MultiDiGraph] = None
-        if use_cache and cache_path.exists():
-            graph = ox.load_graphml(cache_path)
-        else:
-            graph = ox.graph_from_place(place_name, network_type=DEFAULT_NETWORK_TYPE)
-            graph = _ensure_travel_attributes(graph)
-            if use_cache:
-                ox.save_graphml(graph, cache_path)
+    for candidate in place_candidates:
+        slug = _slugify(candidate)
+        cache_path = CACHE_DIR / f"{slug}.graphml"
 
-        if graph is not None:
-            graph = _ensure_travel_attributes(graph)
-        return graph
-    except Exception as exc:  # pragma: no cover - log + fail gracefully
-        print(f"Error fetching graph: {exc}")
-        return None
+        try:
+            graph: Optional[nx.MultiDiGraph] = None
+            if use_cache and cache_path.exists():
+                graph = ox.load_graphml(cache_path)
+            else:
+                graph = ox.graph_from_place(candidate, network_type=DEFAULT_NETWORK_TYPE)
+                graph = _ensure_travel_attributes(graph)
+                if use_cache:
+                    ox.save_graphml(graph, cache_path)
+
+            if graph is not None:
+                graph = _ensure_travel_attributes(graph)
+                return graph
+        except Exception as exc:  # pragma: no cover - log + fail gracefully
+            last_error = exc
+            print(f"Error fetching graph for '{candidate}': {exc}")
+
+    if last_error:
+        print(f"Error fetching graph: {last_error}")
+    return None
 
 
 def _build_weight_function(metric: str, traffic_multiplier: float) -> Tuple[Callable[[int, int, Dict], float], str]:
+    """
+    NetworkX MultiDiGraph edge data is keyed by edge id -> attribute dict.
+    Choose the lightest parallel edge and apply the requested metric.
+    """
     attr = "travel_time" if metric == "duration" else "length"
 
-    def weight(u: int, v: int, data: Dict) -> float:
-        value = data.get(attr)
+    def edge_cost(edge_attrs: Dict) -> float:
+        value = edge_attrs.get(attr)
         if value is None:
-            value = data.get("length", 0.0)
+            value = edge_attrs.get("length", 0.0)
         if metric == "duration":
             return value * traffic_multiplier
         return value
+
+    def weight(u: int, v: int, data: Dict) -> float:
+        if not data:
+            return math.inf
+        if attr in data or "length" in data:
+            return edge_cost(data)
+        if isinstance(data, dict):
+            costs = [edge_cost(attrs) for attrs in data.values() if isinstance(attrs, dict)]
+            return min(costs) if costs else math.inf
+        return math.inf
 
     return weight, attr
 
@@ -157,6 +186,11 @@ def calculate_route(
         return None
 
 
+def _strip_accents(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
 def _normalize_drop_points(drop_points: Iterable[Dict]) -> List[Dict]:
     normalized: List[Dict] = []
     for idx, point in enumerate(drop_points, start=1):
@@ -182,10 +216,28 @@ def _optimize_order(
     for stop in stops:
         node = ox.distance.nearest_nodes(graph, stop["coords"][1], stop["coords"][0])
         remaining.append({**stop, "node": node})
+    original_order = list(remaining)
 
     ordered: List[Dict] = []
     current_node = start_node
     weight_fn, _ = _build_weight_function(metric, traffic_multiplier)
+
+    def sequence_cost(sequence: List[Dict]) -> float:
+        cost = 0.0
+        current = start_node
+        for stop in sequence:
+            try:
+                cost += nx.shortest_path_length(
+                    graph,
+                    current,
+                    stop["node"],
+                    weight=weight_fn,
+                    method="dijkstra",
+                )
+            except nx.NetworkXNoPath:
+                return math.inf
+            current = stop["node"]
+        return cost
 
     while remaining:
         best_idx = 0
@@ -208,6 +260,9 @@ def _optimize_order(
         ordered.append(chosen)
         current_node = chosen["node"]
 
+    if sequence_cost(ordered) >= sequence_cost(original_order):
+        ordered = original_order
+
     for stop in ordered:
         stop.pop("node", None)
     return ordered
@@ -222,6 +277,7 @@ def plan_multi_stop_route(
     metric: str = "distance",
     traffic_multiplier: float = 1.0,
     optimize_order: bool = True,
+    return_to_depot: bool = False,
 ) -> Optional[Dict]:
     normalized = _normalize_drop_points(drop_points)
     if not normalized:
@@ -261,6 +317,29 @@ def plan_multi_stop_route(
 
     if not segments:
         return None
+
+    if return_to_depot:
+        return_segment = calculate_route(
+            graph,
+            current_coords,
+            start_coords,
+            algorithm=algorithm,
+            metric=metric,
+            traffic_multiplier=traffic_multiplier,
+        )
+        if return_segment and return_segment["route"]:
+            if all_nodes:
+                all_nodes.extend(return_segment["route"][1:])
+            else:
+                all_nodes.extend(return_segment["route"])
+            segments.append(
+                {
+                    "name": "Depoya dönüş",
+                    "distance_m": return_segment["distance_m"],
+                    "duration_s": return_segment["duration_s"],
+                    "end_coords": start_coords,
+                }
+            )
 
     total_distance = sum(seg["distance_m"] for seg in segments)
     total_duration = sum(seg["duration_s"] for seg in segments)

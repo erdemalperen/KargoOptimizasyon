@@ -244,6 +244,7 @@ if st.sidebar.button("Rotayı Hesapla"):
                     metric=metric_choice,
                     traffic_multiplier=traffic_multiplier,
                     optimize_order=optimize_order,
+                    return_to_depot=return_to_depot,
                 )
                 if result:
                     st.session_state.comparison_results[alg] = result
@@ -274,32 +275,9 @@ if st.sidebar.button("Rotayı Hesapla"):
                 metric=metric_choice,
                 traffic_multiplier=traffic_multiplier,
                 optimize_order=optimize_order,
+                return_to_depot=return_to_depot,
             )
             st.session_state.route_result = None
-            if st.session_state.multi_result and return_to_depot:
-                last_coords = st.session_state.multi_result["segments"][-1]["end_coords"]
-                return_segment = logic.calculate_route(
-                    graph,
-                    last_coords,
-                    start_coords,
-                    algorithm=algorithm_choice,
-                    metric=metric_choice,
-                    traffic_multiplier=traffic_multiplier,
-                )
-                if return_segment and return_segment["route"]:
-                    st.session_state.multi_result["route"].extend(return_segment["route"][1:])
-                    st.session_state.multi_result["distance_m"] += return_segment["distance_m"]
-                    st.session_state.multi_result["duration_s"] += return_segment["duration_s"]
-                    st.session_state.multi_result["segments"].append(
-                        {
-                            "name": "Depoya dönüş",
-                            "distance_m": return_segment["distance_m"],
-                            "duration_s": return_segment["duration_s"],
-                            "end_coords": start_coords,
-                        }
-                    )
-                    if "order" in st.session_state.multi_result:
-                        st.session_state.multi_result["order"].append("Depoya dönüş")
             st.session_state.route_result = None
             st.session_state.comparison_results = None
         else:
