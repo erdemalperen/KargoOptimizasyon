@@ -6,3 +6,4 @@ pandas
 geopy
 streamlit-folium
 requests
+scikit-learn
