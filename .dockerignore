@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+cache
+.pytest_cache
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.md
+pip-install.log
